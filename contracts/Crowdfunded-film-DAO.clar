@@ -7,9 +7,13 @@
 (define-constant ERR_FUNDING_NOT_COMPLETE (err u105))
 (define-constant ERR_ALREADY_VOTED (err u106))
 (define-constant ERR_INVALID_AMOUNT (err u107))
+(define-constant ERR_MILESTONE_NOT_READY (err u108))
+(define-constant ERR_MILESTONE_COMPLETED (err u109))
+(define-constant ERR_INSUFFICIENT_APPROVAL (err u110))
 
 (define-data-var next-film-id uint u0)
 (define-data-var next-reward-id uint u0)
+(define-data-var next-milestone-id uint u0)
 
 (define-map films
   { film-id: uint }
@@ -49,6 +53,25 @@
 (define-map film-voting-power
   { film-id: uint }
   { total-votes: uint, voting-deadline: uint }
+)
+
+(define-map milestones
+  { milestone-id: uint }
+  {
+    film-id: uint,
+    title: (string-ascii 64),
+    funding-amount: uint,
+    approval-votes: uint,
+    rejection-votes: uint,
+    voting-deadline: uint,
+    is-completed: bool,
+    funds-released: bool
+  }
+)
+
+(define-map milestone-votes
+  { milestone-id: uint, voter: principal }
+  { vote-type: bool, vote-weight: uint }
 )
 
 (define-public (create-film (title (string-ascii 64)) (description (string-ascii 256)) (funding-goal uint) (days-to-deadline uint))
@@ -323,4 +346,127 @@
       )
     none
   )
+)
+
+(define-public (create-milestone (film-id uint) (title (string-ascii 64)) (funding-amount uint) (voting-days uint))
+  (let 
+    (
+      (film-data (unwrap! (map-get? films { film-id: film-id }) ERR_NOT_FOUND))
+      (milestone-id (var-get next-milestone-id))
+      (voting-deadline (+ stacks-block-height (* voting-days u144)))
+    )
+    (asserts! (is-eq tx-sender (get creator film-data)) ERR_UNAUTHORIZED)
+    (asserts! (get is-funded film-data) ERR_FUNDING_NOT_COMPLETE)
+    (asserts! (> funding-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (> voting-days u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= funding-amount (get funding-raised film-data)) ERR_INSUFFICIENT_FUNDS)
+    
+    (map-set milestones
+      { milestone-id: milestone-id }
+      {
+        film-id: film-id,
+        title: title,
+        funding-amount: funding-amount,
+        approval-votes: u0,
+        rejection-votes: u0,
+        voting-deadline: voting-deadline,
+        is-completed: false,
+        funds-released: false
+      }
+    )
+    
+    (var-set next-milestone-id (+ milestone-id u1))
+    (ok milestone-id)
+  )
+)
+
+(define-public (vote-on-milestone (milestone-id uint) (approve bool))
+  (let 
+    (
+      (milestone-data (unwrap! (map-get? milestones { milestone-id: milestone-id }) ERR_NOT_FOUND))
+      (film-data (unwrap! (map-get? films { film-id: (get film-id milestone-data) }) ERR_NOT_FOUND))
+      (backing-data (unwrap! (map-get? film-backers { film-id: (get film-id milestone-data), backer: tx-sender }) ERR_UNAUTHORIZED))
+      (existing-vote (map-get? milestone-votes { milestone-id: milestone-id, voter: tx-sender }))
+    )
+    (asserts! (is-none existing-vote) ERR_ALREADY_VOTED)
+    (asserts! (<= stacks-block-height (get voting-deadline milestone-data)) ERR_DEADLINE_PASSED)
+    (asserts! (not (get is-completed milestone-data)) ERR_MILESTONE_COMPLETED)
+    
+    (let 
+      (
+        (vote-weight (get amount backing-data))
+        (new-approval-votes (if approve (+ (get approval-votes milestone-data) vote-weight) (get approval-votes milestone-data)))
+        (new-rejection-votes (if approve (get rejection-votes milestone-data) (+ (get rejection-votes milestone-data) vote-weight)))
+      )
+      (map-set milestone-votes
+        { milestone-id: milestone-id, voter: tx-sender }
+        { vote-type: approve, vote-weight: vote-weight }
+      )
+      
+      (map-set milestones
+        { milestone-id: milestone-id }
+        (merge milestone-data {
+          approval-votes: new-approval-votes,
+          rejection-votes: new-rejection-votes
+        })
+      )
+      
+      (ok vote-weight)
+    )
+  )
+)
+
+(define-public (complete-milestone (milestone-id uint))
+  (let 
+    (
+      (milestone-data (unwrap! (map-get? milestones { milestone-id: milestone-id }) ERR_NOT_FOUND))
+      (film-data (unwrap! (map-get? films { film-id: (get film-id milestone-data) }) ERR_NOT_FOUND))
+      (total-funding (get funding-raised film-data))
+      (approval-threshold (/ (* total-funding u51) u100))
+    )
+    (asserts! (is-eq tx-sender (get creator film-data)) ERR_UNAUTHORIZED)
+    (asserts! (> stacks-block-height (get voting-deadline milestone-data)) ERR_MILESTONE_NOT_READY)
+    (asserts! (not (get is-completed milestone-data)) ERR_MILESTONE_COMPLETED)
+    (asserts! (>= (get approval-votes milestone-data) approval-threshold) ERR_INSUFFICIENT_APPROVAL)
+    
+    (map-set milestones
+      { milestone-id: milestone-id }
+      (merge milestone-data { is-completed: true })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (release-milestone-funds (milestone-id uint))
+  (let 
+    (
+      (milestone-data (unwrap! (map-get? milestones { milestone-id: milestone-id }) ERR_NOT_FOUND))
+      (film-data (unwrap! (map-get? films { film-id: (get film-id milestone-data) }) ERR_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get creator film-data)) ERR_UNAUTHORIZED)
+    (asserts! (get is-completed milestone-data) ERR_MILESTONE_NOT_READY)
+    (asserts! (not (get funds-released milestone-data)) ERR_ALREADY_EXISTS)
+    
+    (try! (as-contract (stx-transfer? (get funding-amount milestone-data) tx-sender (get creator film-data))))
+    
+    (map-set milestones
+      { milestone-id: milestone-id }
+      (merge milestone-data { funds-released: true })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-milestone-details (milestone-id uint))
+  (map-get? milestones { milestone-id: milestone-id })
+)
+
+(define-read-only (get-milestone-vote (milestone-id uint) (voter principal))
+  (map-get? milestone-votes { milestone-id: milestone-id, voter: voter })
+)
+
+(define-read-only (get-next-milestone-id)
+  (var-get next-milestone-id)
 )
