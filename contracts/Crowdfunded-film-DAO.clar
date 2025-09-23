@@ -10,10 +10,15 @@
 (define-constant ERR_MILESTONE_NOT_READY (err u108))
 (define-constant ERR_MILESTONE_COMPLETED (err u109))
 (define-constant ERR_INSUFFICIENT_APPROVAL (err u110))
+(define-constant ERR_REVENUE_NOT_DISTRIBUTED (err u111))
+(define-constant ERR_NO_REVENUE_TO_CLAIM (err u112))
+(define-constant ERR_ROYALTIES_ALREADY_CLAIMED (err u113))
 
 (define-data-var next-film-id uint u0)
 (define-data-var next-reward-id uint u0)
 (define-data-var next-milestone-id uint u0)
+(define-data-var creator-royalty-percentage uint u3000)
+(define-data-var backers-royalty-percentage uint u7000)
 
 (define-map films
   { film-id: uint }
@@ -74,6 +79,36 @@
   { vote-type: bool, vote-weight: uint }
 )
 
+(define-map film-revenue
+  { film-id: uint }
+  {
+    total-revenue: uint,
+    creator-share: uint,
+    backers-share: uint,
+    last-distribution-height: uint,
+    is-distributing: bool
+  }
+)
+
+(define-map backer-royalties
+  { film-id: uint, backer: principal }
+  {
+    total-earned: uint,
+    claimed-amount: uint,
+    last-claim-height: uint
+  }
+)
+
+(define-map revenue-distribution-log
+  { film-id: uint, distribution-id: uint }
+  {
+    total-distributed: uint,
+    creator-payout: uint,
+    backers-payout: uint,
+    distribution-height: uint
+  }
+)
+
 (define-public (create-film (title (string-ascii 64)) (description (string-ascii 256)) (funding-goal uint) (days-to-deadline uint))
   (let 
     (
@@ -100,6 +135,17 @@
     (map-set film-voting-power
       { film-id: film-id }
       { total-votes: u0, voting-deadline: (+ deadline u1440) }
+    )
+    
+    (map-set film-revenue 
+      { film-id: film-id }
+      {
+        total-revenue: u0,
+        creator-share: u0,
+        backers-share: u0,
+        last-distribution-height: u0,
+        is-distributing: false
+      }
     )
     
     (var-set next-film-id (+ film-id u1))
@@ -469,4 +515,161 @@
 
 (define-read-only (get-next-milestone-id)
   (var-get next-milestone-id)
+)
+
+(define-public (deposit-revenue (film-id uint) (amount uint))
+  (let 
+    (
+      (film-data (unwrap! (map-get? films { film-id: film-id }) ERR_NOT_FOUND))
+      (revenue-data (unwrap! (map-get? film-revenue { film-id: film-id }) ERR_NOT_FOUND))
+      (creator-share (/ (* amount (var-get creator-royalty-percentage)) u10000))
+      (backers-share (- amount creator-share))
+    )
+    (asserts! (is-eq tx-sender (get creator film-data)) ERR_UNAUTHORIZED)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (map-set film-revenue 
+      { film-id: film-id }
+      (merge revenue-data {
+        total-revenue: (+ (get total-revenue revenue-data) amount),
+        creator-share: (+ (get creator-share revenue-data) creator-share),
+        backers-share: (+ (get backers-share revenue-data) backers-share)
+      }))
+    
+    (ok true)
+  )
+)
+
+(define-public (distribute-revenue (film-id uint))
+  (let 
+    (
+      (film-data (unwrap! (map-get? films { film-id: film-id }) ERR_NOT_FOUND))
+      (revenue-data (unwrap! (map-get? film-revenue { film-id: film-id }) ERR_NOT_FOUND))
+      (distribution-id (var-get next-reward-id))
+    )
+    (asserts! (is-eq tx-sender (get creator film-data)) ERR_UNAUTHORIZED)
+    (asserts! (> (get total-revenue revenue-data) u0) ERR_NO_REVENUE_TO_CLAIM)
+    (asserts! (not (get is-distributing revenue-data)) ERR_ALREADY_EXISTS)
+    
+    (map-set film-revenue 
+      { film-id: film-id }
+      (merge revenue-data { is-distributing: true, last-distribution-height: stacks-block-height }))
+    
+    (map-set revenue-distribution-log 
+      { film-id: film-id, distribution-id: distribution-id }
+      {
+        total-distributed: (get total-revenue revenue-data),
+        creator-payout: (get creator-share revenue-data),
+        backers-payout: (get backers-share revenue-data),
+        distribution-height: stacks-block-height
+      })
+    
+    (var-set next-reward-id (+ distribution-id u1))
+    (ok distribution-id)
+  )
+)
+
+(define-public (claim-creator-royalties (film-id uint))
+  (let 
+    (
+      (film-data (unwrap! (map-get? films { film-id: film-id }) ERR_NOT_FOUND))
+      (revenue-data (unwrap! (map-get? film-revenue { film-id: film-id }) ERR_NOT_FOUND))
+      (creator-share (get creator-share revenue-data))
+    )
+    (asserts! (is-eq tx-sender (get creator film-data)) ERR_UNAUTHORIZED)
+    (asserts! (get is-distributing revenue-data) ERR_REVENUE_NOT_DISTRIBUTED)
+    (asserts! (> creator-share u0) ERR_NO_REVENUE_TO_CLAIM)
+    
+    (try! (as-contract (stx-transfer? creator-share tx-sender (get creator film-data))))
+    
+    (map-set film-revenue 
+      { film-id: film-id }
+      (merge revenue-data { creator-share: u0 }))
+      
+    (ok creator-share)
+  )
+)
+
+(define-public (claim-backer-royalties (film-id uint))
+  (let 
+    (
+      (film-data (unwrap! (map-get? films { film-id: film-id }) ERR_NOT_FOUND))
+      (revenue-data (unwrap! (map-get? film-revenue { film-id: film-id }) ERR_NOT_FOUND))
+      (backing-data (unwrap! (map-get? film-backers { film-id: film-id, backer: tx-sender }) ERR_UNAUTHORIZED))
+      (backer-royalty (unwrap! (map-get? backer-royalties { film-id: film-id, backer: tx-sender }) ERR_NOT_FOUND))
+      (backers-share (get backers-share revenue-data))
+      (total-funding (get funding-raised film-data))
+      (backer-contribution (get amount backing-data))
+      (claimable-amount (/ (* backers-share backer-contribution) total-funding))
+    )
+    (asserts! (get is-distributing revenue-data) ERR_REVENUE_NOT_DISTRIBUTED)
+    (asserts! (> claimable-amount u0) ERR_NO_REVENUE_TO_CLAIM)
+    (asserts! (is-eq (get last-claim-height backer-royalty) u0) ERR_ROYALTIES_ALREADY_CLAIMED)
+    
+    (try! (as-contract (stx-transfer? claimable-amount tx-sender tx-sender)))
+    
+    (map-set backer-royalties 
+      { film-id: film-id, backer: tx-sender }
+      (merge backer-royalty {
+        total-earned: (+ (get total-earned backer-royalty) claimable-amount),
+        claimed-amount: (+ (get claimed-amount backer-royalty) claimable-amount),
+        last-claim-height: stacks-block-height
+      }))
+    
+    (ok claimable-amount)
+  )
+)
+
+(define-public (reset-distribution (film-id uint))
+  (let 
+    (
+      (film-data (unwrap! (map-get? films { film-id: film-id }) ERR_NOT_FOUND))
+      (revenue-data (unwrap! (map-get? film-revenue { film-id: film-id }) ERR_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get creator film-data)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get creator-share revenue-data) u0) ERR_NO_REVENUE_TO_CLAIM)
+    
+    (map-set film-revenue 
+      { film-id: film-id }
+      (merge revenue-data { is-distributing: false, backers-share: u0, total-revenue: u0 }))
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-film-revenue (film-id uint))
+  (map-get? film-revenue { film-id: film-id })
+)
+
+(define-read-only (get-backer-royalties (film-id uint) (backer principal))
+  (map-get? backer-royalties { film-id: film-id, backer: backer })
+)
+
+(define-read-only (get-claimable-royalties (film-id uint) (backer principal))
+  (match (map-get? film-revenue { film-id: film-id })
+    revenue-data 
+      (match (map-get? film-backers { film-id: film-id, backer: backer })
+        backing-data
+          (let 
+            (
+              (backers-share (get backers-share revenue-data))
+              (total-funding (get funding-raised (unwrap! (map-get? films { film-id: film-id }) ERR_NOT_FOUND)))
+              (backer-contribution (get amount backing-data))
+            )
+            (ok (some (/ (* backers-share backer-contribution) total-funding))))
+        (ok none))
+    (ok none))
+)
+
+(define-read-only (get-revenue-distribution-log (film-id uint) (distribution-id uint))
+  (map-get? revenue-distribution-log { film-id: film-id, distribution-id: distribution-id })
+)
+
+(define-read-only (get-royalty-percentages)
+  {
+    creator: (var-get creator-royalty-percentage),
+    backers: (var-get backers-royalty-percentage)
+  }
 )
