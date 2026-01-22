@@ -13,6 +13,8 @@
 (define-constant ERR_REVENUE_NOT_DISTRIBUTED (err u111))
 (define-constant ERR_NO_REVENUE_TO_CLAIM (err u112))
 (define-constant ERR_ROYALTIES_ALREADY_CLAIMED (err u113))
+(define-constant ERR_REFUND_NOT_AVAILABLE (err u114))
+(define-constant ERR_ALREADY_REFUNDED (err u115))
 
 (define-data-var next-film-id uint u0)
 (define-data-var next-reward-id uint u0)
@@ -36,7 +38,7 @@
 
 (define-map film-backers
   { film-id: uint, backer: principal }
-  { amount: uint, reward-tier: uint }
+  { amount: uint, reward-tier: uint, refunded: bool }
 )
 
 (define-map backer-votes
@@ -157,7 +159,7 @@
   (let 
     (
       (film-data (unwrap! (map-get? films { film-id: film-id }) ERR_NOT_FOUND))
-      (current-backing (default-to { amount: u0, reward-tier: u0 } (map-get? film-backers { film-id: film-id, backer: tx-sender })))
+      (current-backing (default-to { amount: u0, reward-tier: u0, refunded: false } (map-get? film-backers { film-id: film-id, backer: tx-sender })))
     )
     (asserts! (> amount u0) ERR_INVALID_AMOUNT)
     (asserts! (<= stacks-block-height (get deadline film-data)) ERR_DEADLINE_PASSED)
@@ -181,7 +183,7 @@
       
       (map-set film-backers
         { film-id: film-id, backer: tx-sender }
-        { amount: new-backing-amount, reward-tier: reward-tier }
+        { amount: new-backing-amount, reward-tier: reward-tier, refunded: false }
       )
       
       (ok true)
@@ -672,4 +674,50 @@
     creator: (var-get creator-royalty-percentage),
     backers: (var-get backers-royalty-percentage)
   }
+)
+
+(define-public (request-refund (film-id uint))
+  (let 
+    (
+      (film-data (unwrap! (map-get? films { film-id: film-id }) ERR_NOT_FOUND))
+      (backing-data (unwrap! (map-get? film-backers { film-id: film-id, backer: tx-sender }) ERR_UNAUTHORIZED))
+      (refund-amount (get amount backing-data))
+    )
+    (asserts! (> stacks-block-height (get deadline film-data)) ERR_REFUND_NOT_AVAILABLE)
+    (asserts! (not (get is-funded film-data)) ERR_REFUND_NOT_AVAILABLE)
+    (asserts! (not (get refunded backing-data)) ERR_ALREADY_REFUNDED)
+    (asserts! (> refund-amount u0) ERR_INVALID_AMOUNT)
+    
+    (try! (as-contract (stx-transfer? refund-amount tx-sender tx-sender)))
+    
+    (map-set film-backers
+      { film-id: film-id, backer: tx-sender }
+      (merge backing-data { refunded: true, amount: u0 })
+    )
+    
+    (map-set films
+      { film-id: film-id }
+      (merge film-data { funding-raised: (- (get funding-raised film-data) refund-amount) })
+    )
+    
+    (ok refund-amount)
+  )
+)
+
+(define-read-only (is-refund-available (film-id uint))
+  (match (map-get? films { film-id: film-id })
+    film-data 
+      (and 
+        (> stacks-block-height (get deadline film-data))
+        (not (get is-funded film-data))
+      )
+    false
+  )
+)
+
+(define-read-only (get-refund-status (film-id uint) (backer principal))
+  (match (map-get? film-backers { film-id: film-id, backer: backer })
+    backing-data (some (get refunded backing-data))
+    none
+  )
 )
